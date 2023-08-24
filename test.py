@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch,utils.data as data
+import torch.utils.data as data
 import torchvision
 import torchvision.transforms as transforms #이미지 전처리 라이브러리
 import torchvision.datasets as datasets
@@ -48,9 +48,9 @@ mean = (0.485, 0.456, 0.406)
 std = (0.229, 0.224, 0.225)
 batch_size = 32
 
-cat_directory = r'C:/Users/RYU/Desktop/classify/cat/' #400개의 이미지
-dog_directory = r'C:/Users/RYU/Desktop/classify/dog/' #400개의 이미지
-test_directory = r'C:/Users/RYU/Desktop/classify/test1/'
+cat_directory = r'C:/Users/dh-ry/Desktop/dogvscat/train/cat' #400개의 이미지
+dog_directory = r'C:/Users/dh-ry/Desktop/dogvscat/train/dog/' #400개의 이미지
+test_directory = r'C:/Users/dh-ry/Desktop/dogvscat/funny test/test1'
 
 cat_images_filepaths = sorted([os.path.join(cat_directory, f) for f in os.listdir(cat_directory)]) #이미지 경로와 파일명을 붙여서 리스트로 반환
 dog_images_filepaths = sorted([os.path.join(dog_directory, f) for f in os.listdir(dog_directory)])
@@ -103,9 +103,9 @@ dataloader_dict = {'train': train_iterator, 'val': valid_iterator} #훈련 검�
 class BasicBlock(nn.Module): #ResNet18, 34등에 관계없이 ResNet이라면 무조건 존재하는 기본 블록, 3x3 두 개로 구성되어 있다.
     expansion = 1
     
-    def __init__(self, in_channels, out_channels, stride=1, downsample=False):
+    def __init__(self, in_channels, out_channels, stride, downsample=False):
         super().__init__() #클래스의 모양을 보면 이 클래스는 자식 클래스다. 부모 클래스인 nn.module안에 있는 매직 메소드를 여기서도 사용하기 위해 super로 상속시킨다.
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)#우리는 이 클래스에서 conv1을 정의한 적이 없지만, super로 인해 사용할 수 있게 됐다.
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)#우리는 이 클래스에서 conv1을 정의한 적이 없지만, super로 인해 사용할 수 있게 됐다.
         #3X3 사이즈의 커널이 1만큼의 패딩으로 둘러싸고 있는 이미지를 1만큼의 간격(stride)으로 이동하며 스캔한다.
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
@@ -136,7 +136,104 @@ class BasicBlock(nn.Module): #ResNet18, 34등에 관계없이 ResNet이라면 �
         
         return x
         
+    
+
+class Bottleneck(nn.Module): #병목 블록은 1x1 3x3 1x1 구조이며, 1x1 블록에서 차원 수를 조정하고 연산한 뒤 마지막 1x1 블록에서 차원을 맞춰줌.
+    expansion = 4
+    
+    def __init__(self, in_channels, out_channels, stride, downsample=False):
+        super().__init__()
+        self.conv1 = nn.Conv2D(in_channels, out_channels, kernel_size=1, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2D(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.conv3 = nn.Conv2D(out_channels, out_channels*self.expansion, kernel_size=1, stride=1, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels*self.expansion)
+        self.relu = nn.ReLU(inplace=True) #inplace를 True로 설정하면 입력 텐서의 변화로 연산 속도 향상되나, 입력값이 변하므로 다른 연산에 차질 생길 수 있음.
         
+        if downsample:
+            conv = nn.Conv2d(in_channels, self.expansion*out_channels, kernel_size=1, stride=1, bias=False)
+            bn = nn.BatchNorm2d(self.expansion*out_channels)
+            downsample = nn.Sequeltial(conv, bn)
+        else:
+            downsample = None
+        self.downsample = downsample
+    
+    def forward(self, x):
+        i = x
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.conv3(x)
+        x = self.bn3(x)
+        
+        if self.downsample is not None:
+            i = self.downsample(i)
+        
+        x += i
+        x = self.relu(x)
+        
+        return x #비선형적 계산이 용이해짐.
+
+class ResNet(nn.Module):
+    def __init__(self, config, output_dim, zero_init_residual=False):
+        super().__init__()
+        
+        block, n_blocks, channels = config
+        self.in_channels = channels[0]
+        assert len(n_blocks) == len(channels) == 4
+        self.conv1 = nn.Conv2d(3, self.in_channels, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(self.in_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        
+        self.layer1 = self.get_resnet_layer(block, n_blocks[0], channels[0])
+        self.layer2 = self.get_resnet_layer(block, n_blocks[1], channels[1], stride=2)   
+        self.layer3 = self.get_resnet_layer(block, n_blocks[2], channels[2], stride=2)   
+        self.layer4 = self.get_resnet_layer(block, n_blocks[3], channels[3], stride=2)
+        
+        self.avgpool = nn.AdaptiveAvgPool2d((1,1))
+        self.fc = nn.Linear(self.in_channels, output_dim)
+        
+        if zero_init_residual:
+            for m in self.modules():
+                if isinstance(m, Bottleneck):
+                    nn.init.constant_(m.bn3.weight, 0)
+                elif isinstance(m, BasicBlock):
+                    nn.init.constant_(m.bn2.weight, 0)
+    
+    def get_resnet_layer(self, block, n_blocks, channels, stride=1):
+        layers = []
+        if self.in_channels != block.expansion * channels:
+            downsample = True
+        else:
+            downsample = False
+        
+        layers.append(block(self.in_channels, channels, stride, downsample))
+        for i in range(1, n_blocks):
+            layers.append(block(block.expansion*channels, channels))
+            
+        self.in_channels = block.expansion * channels
+        return nn.Sequeltial(*layers)
+    
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.avgpool(x)
+        h = x.view(x.shape[0], -1)
+        x = self.fc(h)
+        return x, h
+        
+
 summary(model, input_size=(3,224,224))
 
 optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
@@ -249,81 +346,3 @@ def display_image_grid(images_filepaths, predicted_labels=(), cols=40):
     plt.show()
 
 display_image_grid(test_images_filepaths)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
